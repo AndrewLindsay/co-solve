@@ -1,6 +1,7 @@
 import SwiftUI
 #if os(iOS)
 import UIKit
+import AppTrackingTransparency
 #endif
 
 @main
@@ -25,6 +26,11 @@ struct CoSolveApp: App {
                 .environmentObject(store)
                 .environmentObject(consentManager)
                 .task {
+                    // Build 4 privacy gate:
+                    // Resolve Apple's ATT permission BEFORE invoking UMP or the
+                    // Google Mobile Ads SDK. This makes the ordering explicit:
+                    // ATT -> UMP/legal consent -> ad SDK/ad requests.
+                    await requestATTBeforeThirdPartyAdvertisingSDKs()
                     await consentManager.gatherConsentAndStartAds()
                 }
             #else
@@ -53,6 +59,26 @@ struct CoSolveApp: App {
         }
         #endif
     }
+
+    #if os(iOS)
+    @MainActor
+    private func requestATTBeforeThirdPartyAdvertisingSDKs() async {
+        let currentStatus = ATTrackingManager.trackingAuthorizationStatus
+        print("[ATT] Pre-SDK gate status: \(currentStatus.rawValue)")
+
+        guard currentStatus == .notDetermined else {
+            print("[ATT] Pre-SDK gate already resolved")
+            return
+        }
+
+        // ATT only presents while the app is active. Yield once so the first
+        // SwiftUI scene has completed presentation before requesting it.
+        await Task.yield()
+
+        let status = await ATTrackingManager.requestTrackingAuthorization()
+        print("[ATT] Pre-SDK gate completed: \(status.rawValue)")
+    }
+    #endif
 }
 
 #if os(iOS)
