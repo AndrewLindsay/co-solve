@@ -18,6 +18,17 @@ final class GoogleMobileAdsConsentManager: ObservableObject {
     private var didStartAds = false
 
     func gatherConsentAndStartAds() async {
+        // Build 4 hard gate. UMP and Google Mobile Ads must never be invoked
+        // while Apple's ATT state is still notDetermined.
+        guard ATTrackingManager.trackingAuthorizationStatus != .notDetermined else {
+            canRequestAds = false
+            statusMessage = "Advertising is waiting for tracking permission."
+            print("[Privacy] BLOCKED: UMP was not started because ATT is still notDetermined")
+            return
+        }
+
+        print("[Privacy] ATT resolved before UMP: \(ATTrackingManager.trackingAuthorizationStatus.rawValue)")
+
 #if DEBUG
         await runConsentFlow(mode: debugMode, resetFirst: AdConfiguration.resetConsentOnDebugLaunch)
 #else
@@ -30,6 +41,12 @@ final class GoogleMobileAdsConsentManager: ObservableObject {
     /// the region selected in the About & Privacy diagnostic controls.
     func resetConsentAndTestAgain() async {
         guard !debugTestRunning else { return }
+        guard ATTrackingManager.trackingAuthorizationStatus != .notDetermined else {
+            statusMessage = "Resolve tracking permission before testing advertising privacy."
+            print("[Privacy] BLOCKED: UMP debug test requested while ATT is still notDetermined")
+            return
+        }
+
         debugTestRunning = true
         defer { debugTestRunning = false }
 
@@ -45,6 +62,7 @@ final class GoogleMobileAdsConsentManager: ObservableObject {
         parameters.isTaggedForUnderAgeOfConsent = false
 
         print("[UMP] ===== Co-Solve UMP Debug Start =====")
+        print("[UMP] ATT entering UMP: \(ATTrackingManager.trackingAuthorizationStatus.rawValue)")
         print("[UMP] Bundle ID: \(Bundle.main.bundleIdentifier ?? "<missing>")")
         print("[UMP] GADApplicationIdentifier: \(Bundle.main.object(forInfoDictionaryKey: "GADApplicationIdentifier") as? String ?? "<missing>")")
 
@@ -145,6 +163,15 @@ final class GoogleMobileAdsConsentManager: ObservableObject {
         eeaTestRequested: Bool,
         selectedTestRegion: String?
     ) async {
+        // Defence in depth: even an accidental future call into this method
+        // cannot contact UMP until ATT has a resolved state.
+        guard ATTrackingManager.trackingAuthorizationStatus != .notDetermined else {
+            canRequestAds = false
+            statusMessage = "Advertising is waiting for tracking permission."
+            print("[Privacy] BLOCKED: performConsentRequest called while ATT is notDetermined")
+            return
+        }
+
         do {
             try await ConsentInformation.shared.requestConsentInfoUpdate(with: parameters)
             print("[UMP] Consent info update succeeded")
@@ -164,10 +191,6 @@ final class GoogleMobileAdsConsentManager: ObservableObject {
             print("[UMP] ERROR: \(error.localizedDescription)")
         }
 
-        // Apple requires the system ATT decision before any advertising SDK
-        // request that could use data for tracking. UMP consent and ATT are
-        // separate permissions, so complete UMP first, then ATT, then ads.
-        await requestTrackingAuthorizationIfNeeded()
         refreshState()
         startAdsIfAllowed()
 
@@ -180,6 +203,12 @@ final class GoogleMobileAdsConsentManager: ObservableObject {
     }
 
     func presentPrivacyOptions() async {
+        guard ATTrackingManager.trackingAuthorizationStatus != .notDetermined else {
+            statusMessage = "Resolve tracking permission before changing advertising privacy choices."
+            print("[Privacy] BLOCKED: privacy options requested while ATT is notDetermined")
+            return
+        }
+
         do {
             try await ConsentForm.presentPrivacyOptionsForm(from: nil)
         } catch {
@@ -192,6 +221,12 @@ final class GoogleMobileAdsConsentManager: ObservableObject {
 
 #if DEBUG
     func presentAdInspector() async {
+        guard ATTrackingManager.trackingAuthorizationStatus != .notDetermined else {
+            statusMessage = "Resolve tracking permission before opening Ad Inspector."
+            print("[AdMob] BLOCKED: Ad Inspector requested while ATT is notDetermined")
+            return
+        }
+
         print("[AdMob] Opening Ad Inspector…")
         do {
             try await MobileAds.shared.presentAdInspector(from: nil)
@@ -203,24 +238,10 @@ final class GoogleMobileAdsConsentManager: ObservableObject {
     }
 #endif
 
-    private func requestTrackingAuthorizationIfNeeded() async {
-        let currentStatus = ATTrackingManager.trackingAuthorizationStatus
-        print("[ATT] Current status: \(currentStatus.rawValue)")
-
-        guard currentStatus == .notDetermined else {
-            print("[ATT] Permission already decided; no prompt required")
-            return
-        }
-
-        // This is Apple's system permission dialog. It is intentionally shown
-        // only after any required UMP privacy form has finished.
-        let newStatus = await ATTrackingManager.requestTrackingAuthorization()
-        print("[ATT] Request completed with status: \(newStatus.rawValue)")
-    }
-
     private func refreshState() {
         let umpAllowsAds = ConsentInformation.shared.canRequestAds
-        let attResolved = ATTrackingManager.trackingAuthorizationStatus != .notDetermined
+        let attStatus = ATTrackingManager.trackingAuthorizationStatus
+        let attResolved = attStatus != .notDetermined
 
         // A denial/restriction of ATT does NOT disable ads. It prevents use of
         // the IDFA. Google Mobile Ads can still request ads without the IDFA.
@@ -230,10 +251,17 @@ final class GoogleMobileAdsConsentManager: ObservableObject {
             ? "Advertising privacy choices are up to date."
             : "Advertising is waiting for privacy choices."
 
-        print("[Privacy] Final state: canRequestAds=\(canRequestAds), UMP=\(umpAllowsAds), ATT=\(ATTrackingManager.trackingAuthorizationStatus.rawValue), privacyOptionsRequired=\(privacyOptionsRequired), consentStatus=\(ConsentInformation.shared.consentStatus.rawValue)")
+        print("[Privacy] Final state: canRequestAds=\(canRequestAds), UMP=\(umpAllowsAds), ATT=\(attStatus.rawValue), privacyOptionsRequired=\(privacyOptionsRequired), consentStatus=\(ConsentInformation.shared.consentStatus.rawValue)")
     }
 
     private func startAdsIfAllowed() {
+        let attStatus = ATTrackingManager.trackingAuthorizationStatus
+        guard attStatus != .notDetermined else {
+            canRequestAds = false
+            print("[AdMob] BLOCKED: SDK cannot start while ATT is notDetermined")
+            return
+        }
+
         guard canRequestAds, !didStartAds else {
             if !canRequestAds {
                 print("[AdMob] SDK not started: consent does not yet permit ad requests")
@@ -242,7 +270,7 @@ final class GoogleMobileAdsConsentManager: ObservableObject {
         }
         didStartAds = true
         MobileAds.shared.start()
-        print("[AdMob] Mobile Ads SDK started")
+        print("[AdMob] Mobile Ads SDK started after ATT=\(attStatus.rawValue)")
     }
 }
 #endif
