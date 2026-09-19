@@ -30,7 +30,11 @@ struct CoSolveApp: App {
                     // Resolve Apple's ATT permission BEFORE invoking UMP or the
                     // Google Mobile Ads SDK. This makes the ordering explicit:
                     // ATT -> UMP/legal consent -> ad SDK/ad requests.
-                    await requestATTBeforeThirdPartyAdvertisingSDKs()
+                    let attResolved = await requestATTBeforeThirdPartyAdvertisingSDKs()
+                    guard attResolved else {
+                        print("[Privacy] Third-party advertising privacy flow stopped because ATT remains notDetermined")
+                        return
+                    }
                     await consentManager.gatherConsentAndStartAds()
                 }
             #else
@@ -62,21 +66,56 @@ struct CoSolveApp: App {
 
     #if os(iOS)
     @MainActor
-    private func requestATTBeforeThirdPartyAdvertisingSDKs() async {
-        let currentStatus = ATTrackingManager.trackingAuthorizationStatus
-        print("[ATT] Pre-SDK gate status: \(currentStatus.rawValue)")
+    private func requestATTBeforeThirdPartyAdvertisingSDKs() async -> Bool {
+        var status = ATTrackingManager.trackingAuthorizationStatus
+        print("[ATT] Pre-SDK gate status: \(status.rawValue)")
 
-        guard currentStatus == .notDetermined else {
-            print("[ATT] Pre-SDK gate already resolved")
-            return
+        guard status == .notDetermined else {
+            print("[ATT] Pre-SDK gate already resolved: \(status.rawValue)")
+            return true
         }
 
-        // ATT only presents while the app is active. Yield once so the first
-        // SwiftUI scene has completed presentation before requesting it.
-        await Task.yield()
+        // ATT needs a foreground-active scene to present reliably. A SwiftUI
+        // .task can begin before the first scene has fully become active, so
+        // wait briefly for that lifecycle state before requesting permission.
+        let activeDeadline = Date().addingTimeInterval(5.0)
+        while UIApplication.shared.applicationState != .active,
+              Date() < activeDeadline {
+            try? await Task.sleep(for: .milliseconds(100))
+        }
 
-        let status = await ATTrackingManager.requestTrackingAuthorization()
-        print("[ATT] Pre-SDK gate completed: \(status.rawValue)")
+        guard UIApplication.shared.applicationState == .active else {
+            print("[ATT] BLOCKED: app did not become active; UMP/ads will not start")
+            return false
+        }
+
+        // Give the active scene one short presentation interval before asking
+        // iOS to display its system permission sheet.
+        try? await Task.sleep(for: .milliseconds(350))
+
+        print("[ATT] Requesting authorization before any UMP/AdMob call")
+        status = await ATTrackingManager.requestTrackingAuthorization()
+        print("[ATT] Request returned status: \(status.rawValue)")
+
+        // On some OS states requestTrackingAuthorization can return while the
+        // public status is still notDetermined. Never fall through to Google
+        // SDKs in that state. Allow a short window for the system status to
+        // settle after the permission sheet is dismissed.
+        let resolutionDeadline = Date().addingTimeInterval(3.0)
+        while ATTrackingManager.trackingAuthorizationStatus == .notDetermined,
+              Date() < resolutionDeadline {
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+
+        status = ATTrackingManager.trackingAuthorizationStatus
+        print("[ATT] Pre-SDK gate final status: \(status.rawValue)")
+
+        if status == .notDetermined {
+            print("[ATT] BLOCKED: ATT remains notDetermined; UMP/AdMob will not start")
+            return false
+        }
+
+        return true
     }
     #endif
 }
